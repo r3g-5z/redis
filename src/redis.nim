@@ -35,10 +35,15 @@
 ##
 ##    waitFor main()
 
-import net, asyncdispatch, asyncnet, os, strutils, parseutils, deques, options
+import net, asyncdispatch, asyncnet, os, strutils, parseutils, deques, options, macros
+import sequtils, tables, times
 
 const
   redisNil* = "\0\0"
+  redisCl* = "\r\n"
+  redisDol* = "$"
+
+var redisOut*: string
 
 type
   Pipeline = ref object
@@ -71,6 +76,7 @@ type
     message*: string
   ReplyError* = object of IOError ## Invalid reply from redis
   RedisError* = object of IOError ## Error in redis
+  WatchError* = object of IOError ## Watch error in redis
 
   RedisCursor* = ref object
     position*: BiggestInt
@@ -82,12 +88,10 @@ proc newPipeline(): Pipeline =
   result.expected = 0
 
 proc newCursor*(pos: BiggestInt = 0): RedisCursor =
-  result = RedisCursor(
-    position: pos
-  )
+  RedisCursor(position: pos)
 
 proc `$`*(cursor: RedisCursor): string =
-  result = $cursor.position
+  $cursor.position
 
 proc open*(host = "localhost", port = 6379.Port): Redis =
   ## Open a synchronous connection to a redis server.
@@ -122,6 +126,10 @@ proc raiseReplyError(r: Redis | AsyncRedis, msg: string) =
 proc raiseRedisError(r: Redis | AsyncRedis, msg: string) =
   finaliseCommand(r)
   raise newException(RedisError, msg)
+
+proc raiseWatchError(r: Redis | AsyncRedis, msg: string) =
+  finaliseCommand(r)
+  raise newException(WatchError, msg)
 
 proc managedSend(
   r: Redis | AsyncRedis, data: string
@@ -175,12 +183,14 @@ proc raiseNoOK(r: Redis | AsyncRedis, status: string) =
   elif not pipelined and status != "OK":
     raiseReplyError(r, "Expected \"OK\" got \"$1\"" % status)
 
-proc parseStatus(r: Redis | AsyncRedis, line: string = ""): RedisStatus =
+proc parseStatus(r: Redis | AsyncRedis, line = ""): RedisStatus =
   if r.pipeline.enabled:
     return "PIPELINED"
 
   if line == "":
     raiseRedisError(r, "Server closed connection prematurely")
+
+  redisOut.add line & "\r\n"
 
   if line[0] == '-':
     raiseRedisError(r, strip(line))
@@ -198,7 +208,7 @@ proc readStatus(r: Redis | AsyncRedis): Future[RedisStatus] {.multisync.} =
   result = r.parseStatus(line)
   finaliseCommand(r)
 
-proc parseInteger(r: Redis | AsyncRedis, line: string = ""): RedisInteger =
+proc parseInteger(r: Redis | AsyncRedis, line = ""): RedisInteger =
   if r.pipeline.enabled:
     return -1
 
@@ -207,6 +217,8 @@ proc parseInteger(r: Redis | AsyncRedis, line: string = ""): RedisInteger =
 
   if line == "":
     raiseRedisError(r, "Server closed connection prematurely")
+
+  redisOut.add line & "\r\n"
 
   if line[0] == '-':
     raiseRedisError(r, strip(line))
@@ -248,6 +260,7 @@ proc readSingleString(
     return
 
   var s = await r.managedRecv(numBytes + 2)
+  redisOut.add(line & s)
   result = some(strip(s))
 
 proc readSingleString(r: Redis | AsyncRedis): Future[RedisString] {.multisync.} =
@@ -263,6 +276,7 @@ proc readSingleString(r: Redis | AsyncRedis): Future[RedisString] {.multisync.} 
 proc readNext(r: Redis): RedisList
 proc readNext(r: AsyncRedis): Future[RedisList]
 proc readArrayLines(r: Redis | AsyncRedis, countLine: string): Future[RedisList] {.multisync.} =
+  redisOut.add countline & "\r\n"
   if countLine[0] != '*':
     raiseInvalidReply(r, '*', countLine[0])
 
@@ -300,29 +314,40 @@ proc readBulkString(r: Redis | AsyncRedis, allowMBNil = false): Future[RedisStri
 
 proc readArray(r: Redis | AsyncRedis): Future[RedisList] {.multisync.} =
   let line = await r.managedRecvLine()
-  if line.len == 0:
+  if line.len == 0 or line == "+QUEUED":
     return @[]
 
   result = await r.readArrayLines(line)
   finaliseCommand(r)
 
-proc readNext(r: Redis | AsyncRedis): Future[RedisList] {.multisync.} =
-  let line = await r.managedRecvLine()
+proc readArrayToTable(r: Redis | AsyncRedis): Future[Table[string, string]] {.multisync.} =
+  let arr = await r.readArray()
+  for i in countup(0, arr.high, 2):
+    result[arr[i]] = arr[i + 1]
 
-  if line.len == 0:
+proc readNext(r: Redis | AsyncRedis): Future[RedisList] {.multisync.} =
+  let typ = await r.managedRecv(1)
+  if typ.len == 0:
     return @[]
+
+  let line = await r.managedRecvLine()
 
   # TODO: This is no longer an expression due to
   # https://github.com/nim-lang/Nim/issues/8399
   var res: RedisList = @[]
-  case line[0]
-  of '+', '-': res = @[r.parseStatus(line)]
-  of ':': res = @[$(r.parseInteger(line))]
+  case typ[0]
+  of '+':
+    redisOut.add(typ & line & "\r\n")
+    res = @[line]
+  of '-':
+    redisOut.add(typ & line & "\r\n")
+    raiseRedisError(r, strip(line))
+  of ':': res = @[$(r.parseInteger(typ & line))]
   of '$':
-    let x = await r.readSingleString(line, true)
+    let x = await r.readSingleString(typ & line, true)
     res = @[x.get(redisNil)]
   of '*':
-    res = await r.readArrayLines(line)
+    res = await r.readArrayLines(typ & line)
   else:
     raiseReplyError(r, "readNext failed on line: " & line)
 
@@ -333,20 +358,28 @@ proc flushPipeline*(r: Redis | AsyncRedis, wasMulti = false): Future[RedisList] 
   ## Send buffered commands, clear buffer, return results
   if r.pipeline.buffer.len > 0:
     await r.socket.send(r.pipeline.buffer)
-  r.pipeline.buffer = ""
-
+  r.pipeline.buffer.setLen(0)
   r.pipeline.enabled = false
-  result = @[]
 
-  var tot = r.pipeline.expected
+  let expected = r.pipeline.expected
 
-  for i in 0..tot-1:
-    var ret = await r.readNext()
-    for item in ret:
-     if not (item.contains("OK") or item.contains("QUEUED")):
-       result.add(item)
+  if not wasMulti:
+    for i in 0 ..< expected:
+      for item in await r.readNext():
+        if "OK" notin item and "QUEUED" notin item:
+          result.add(item)
+    r.pipeline.expected = 0
+    return
+
+  for i in 0 ..< expected - 1:
+    discard await r.readNext()
+
+  let ret = await r.readNext()
+  result = ret.filterIt("OK" notin it)
 
   r.pipeline.expected = 0
+  if ret.len < expected - 2:
+    r.raiseWatchError("Watched keys changed during transaction")
 
 proc startPipelining*(r: Redis | AsyncRedis) =
   ## Enable command pipelining (reduces network roundtrips).
@@ -357,69 +390,87 @@ proc startPipelining*(r: Redis | AsyncRedis) =
   r.pipeline.expected = 0
   r.pipeline.enabled = true
 
+proc queuePipeline*(r: Redis | AsyncRedis, data: string) {.multisync.} =
+  r.pipeline.buffer.add(data)
+  r.pipeline.expected += 1
+  if r.pipeline.buffer.len >= 8192:
+    await r.socket.send(r.pipeline.buffer)
+    r.pipeline.buffer.setLen(0)
+
+template fmtArg(str: string): untyped {.dirty.} =
+  $str.len & "\r\n" & str & "\r\n"
+
 proc sendCommand(r: Redis | AsyncRedis, cmd: string): Future[void] {.multisync.} =
-  var request = "*1\c\L"
-  request.add("$" & $cmd.len() & "\c\L")
-  request.add(cmd & "\c\L")
+  var request = "*1\r\n"
+  request.add("$" & $cmd.len() & "\r\n")
+  request.add(cmd & "\r\n")
 
   if r.pipeline.enabled:
-    r.pipeline.buffer.add(request)
-    r.pipeline.expected += 1
+    await r.queuePipeline(request)
   else:
     await r.managedSend(request)
 
 proc sendCommand(
   r: Redis | AsyncRedis, cmd: string, args: seq[string]
 ): Future[void] {.multisync.} =
-  var request = "*" & $(1 + args.len()) & "\c\L"
-  request.add("$" & $cmd.len() & "\c\L")
-  request.add(cmd & "\c\L")
-  for i in items(args):
-    request.add("$" & $i.len() & "\c\L")
-    request.add(i & "\c\L")
+  var request = "*" & $(1 + args.len()) & "\r\n"
+  request.add("$" & $cmd.len() & "\r\n")
+  request.add(cmd & "\r\n")
+  for i in args:
+    request.add("$" & $i.len() & "\r\n")
+    request.add(i & "\r\n")
 
   if r.pipeline.enabled:
-    r.pipeline.buffer.add(request)
-    r.pipeline.expected += 1
+    await r.queuePipeline(request)
   else:
     await r.managedSend(request)
 
 proc sendCommand(
   r: Redis | AsyncRedis, cmd: string, arg1: string
 ): Future[void] {.multisync.} =
-  var request = "*2\c\L"
-  request.add("$" & $cmd.len() & "\c\L")
-  request.add(cmd & "\c\L")
-  request.add("$" & $arg1.len() & "\c\L")
-  request.add(arg1 & "\c\L")
+  var request = "*2\r\n"
+  request.add("$" & $cmd.len() & "\r\n")
+  request.add(cmd & "\r\n")
+  request.add("$" & $arg1.len() & "\r\n")
+  request.add(arg1 & "\r\n")
 
   if r.pipeline.enabled:
-    r.pipeline.expected += 1
-    r.pipeline.buffer.add(request)
+    await r.queuePipeline(request)
+  else:
+    await r.managedSend(request)
+
+proc sendCommand(r: Redis | AsyncRedis,
+                 cmd, key, val: string): Future[void] {.multisync.} =
+  let request = "*3" & "\r\n" & "$" &
+    fmtArg(cmd) & "$" & fmtArg(key) & "$" & fmtArg(val)
+
+  if r.pipeline.enabled:
+    await r.queuePipeline(request)
   else:
     await r.managedSend(request)
 
 proc sendCommand(r: Redis | AsyncRedis, cmd: string, arg1: string,
                  args: seq[string]): Future[void] {.multisync.} =
-  var request = "*" & $(2 + args.len()) & "\c\L"
-  request.add("$" & $cmd.len() & "\c\L")
-  request.add(cmd & "\c\L")
-  request.add("$" & $arg1.len() & "\c\L")
-  request.add(arg1 & "\c\L")
-  for i in items(args):
-    request.add("$" & $i.len() & "\c\L")
-    request.add(i & "\c\L")
+  var request = "*" & $(2 + args.len()) & redisCl & redisDol &
+    fmtArg(cmd) & redisDol & fmtArg(arg1)
+
+  for i in args:
+    request.add(redisDol & fmtArg(i))
 
   if r.pipeline.enabled:
-    r.pipeline.expected += 1
-    r.pipeline.buffer.add(request)
+    await r.queuePipeline(request)
   else:
     await r.managedSend(request)
 
 # Keys
 
+proc del*(r: Redis | AsyncRedis, key: string): Future[RedisInteger] {.multisync.} =
+  ## Delete a key
+  await r.sendCommand("DEL", @[key])
+  result = await r.readInteger()
+
 proc del*(r: Redis | AsyncRedis, keys: seq[string]): Future[RedisInteger] {.multisync.} =
-  ## Delete a key or multiple keys
+  ## Delete keys
   await r.sendCommand("DEL", keys)
   result = await r.readInteger()
 
@@ -581,12 +632,11 @@ proc incrBy*(r: Redis | AsyncRedis, key: string, increment: int): Future[RedisIn
 #TODO incrbyfloat
 
 proc msetk*(
-  r: Redis | AsyncRedis,
-  keyValues: seq[tuple[key, value: string]]
+  r: Redis | AsyncRedis, keyValues: seq[(string, string)]
 ): Future[void] {.multisync.} =
-  ## Set mupltiple keys to multplie values
+  ## Set mupltiple keys to multiple values
   var args: seq[string] = @[]
-  for key, value in items(keyValues):
+  for key, value in keyValues.items:
     args.add(key)
     args.add(value)
   await r.sendCommand("MSET", args)
@@ -596,7 +646,7 @@ proc setk*(r: Redis | AsyncRedis, key, value: string): Future[void] {.multisync.
   ## Set the string value of a key.
   ##
   ## NOTE: This function had to be renamed due to a clash with the `set` type.
-  await r.sendCommand("SET", key, @[value])
+  await r.sendCommand("SET", key, value)
   raiseNoOK(r, await r.readStatus())
 
 proc setNX*(r: Redis | AsyncRedis, key, value: string): Future[bool] {.multisync.} =
@@ -629,10 +679,15 @@ proc strlen*(r: Redis | AsyncRedis, key: string): Future[RedisInteger] {.multisy
   result = await r.readInteger()
 
 # Hashes
-proc hDel*(r: Redis | AsyncRedis, key, field: string): Future[bool] {.multisync.} =
+proc hDel*(r: Redis | AsyncRedis, key: string, field: string): Future[bool] {.multisync.} =
   ## Delete a hash field at `key`. Returns `true` if the field was removed.
   await r.sendCommand("HDEL", key, @[field])
   result = (await r.readInteger()) == 1
+
+proc hDel*(r: Redis | AsyncRedis, key: string, fields: seq[string]): Future[RedisInteger] {.multisync.} =
+  ## Delete hash fields at `key`. Returns number of fields removed.
+  await r.sendCommand("HDEL", key, fields)
+  result = await r.readInteger()
 
 proc hExists*(r: Redis | AsyncRedis, key, field: string): Future[bool] {.multisync.} =
   ## Determine if a hash field exists.
@@ -644,10 +699,10 @@ proc hGet*(r: Redis | AsyncRedis, key, field: string): Future[RedisString] {.mul
   await r.sendCommand("HGET", key, @[field])
   result = await r.readBulkString()
 
-proc hGetAll*(r: Redis | AsyncRedis, key: string): Future[RedisList] {.multisync.} =
+proc hGetAll*(r: Redis | AsyncRedis, key: string): Future[Table[string, string]] {.multisync.} =
   ## Get all the fields and values in a hash
   await r.sendCommand("HGETALL", key)
-  result = await r.readArray()
+  result = await r.readArrayToTable()
 
 proc hIncrBy*(r: Redis | AsyncRedis, key, field: string, incr: int): Future[RedisInteger] {.multisync.} =
   ## Increment the integer value of a hash field by the given number
@@ -670,10 +725,10 @@ proc hMGet*(r: Redis | AsyncRedis, key: string, fields: seq[string]): Future[Red
   result = await r.readArray()
 
 proc hMSet*(r: Redis | AsyncRedis, key: string,
-            fieldValues: seq[tuple[field, value: string]]): Future[void] {.multisync.} =
+            fieldValues: seq[(string, string)]): Future[void] {.multisync.} =
   ## Set multiple hash fields to multiple values
   var args = @[key]
-  for field, value in items(fieldValues):
+  for field, value in fieldValues.items:
     args.add(field)
     args.add(value)
   await r.sendCommand("HMSET", args)
@@ -699,27 +754,13 @@ proc hVals*(r: Redis | AsyncRedis, key: string): Future[RedisList] {.multisync.}
 proc bLPop*(r: Redis | AsyncRedis, keys: seq[string], timeout: int): Future[RedisList] {.multisync.} =
   ## Remove and get the *first* element in a list, or block until
   ## one is available
-  var args: seq[string]
-  newSeq(args, len(keys) + 1)
-  for i in items(keys):
-    args.add(i)
-
-  args.add($timeout)
-
-  await r.sendCommand("BLPOP", args)
+  await r.sendCommand("BLPOP", keys & $timeout)
   result = await r.readArray()
 
 proc bRPop*(r: Redis | AsyncRedis, keys: seq[string], timeout: int): Future[RedisList] {.multisync.} =
   ## Remove and get the *last* element in a list, or block until one
   ## is available.
-  var args: seq[string]
-  newSeq(args, len(keys) + 1)
-  for i in items(keys):
-    args.add(i)
-
-  args.add($timeout)
-
-  await r.sendCommand("BRPOP", args)
+  await r.sendCommand("BRPOP", keys & $timeout)
   result = await r.readArray()
 
 proc bRPopLPush*(r: Redis | AsyncRedis, source, destination: string,
@@ -753,7 +794,7 @@ proc lPop*(r: Redis | AsyncRedis, key: string): Future[RedisString] {.multisync.
   await r.sendCommand("LPOP", key)
   result = await r.readBulkString()
 
-proc lPush*(r: Redis | AsyncRedis, key, value: string, create: bool = true): Future[RedisInteger] {.multisync.} =
+proc lPush*(r: Redis | AsyncRedis, key, value: string, create = true): Future[RedisInteger] {.multisync.} =
   ## Prepend a value to a list. Returns the length of the list after the push.
   ## The ``create`` param specifies whether a list should be created if it
   ## doesn't exist at ``key``. More specifically if ``create`` is true, `LPUSH`
@@ -765,11 +806,11 @@ proc lPush*(r: Redis | AsyncRedis, key, value: string, create: bool = true): Fut
 
   result = await r.readInteger()
 
-proc lLPush*(r: Redis | AsyncRedis, key: string, values: seq[string], create: bool = true): Future[RedisInteger] {.multisync.} =
-  ## Append a value to a list. Returns the length of the list after the push.
+proc lPush*(r: Redis | AsyncRedis, key: string, values: seq[string], create = true): Future[RedisInteger] {.multisync.} =
+  ## Prepend a value to a list. Returns the length of the list after the push.
   ## The ``create`` param specifies whether a list should be created if it
-  ## doesn't exist at ``key``. More specifically if ``create`` is true, `RPUSH`
-  ## will be used, otherwise `RPUSHX`.
+  ## doesn't exist at ``key``. More specifically if ``create`` is true, `LPUSH`
+  ## will be used, otherwise `LPUSHX`.
   if create:
     await r.sendCommand("LPUSH", key, values)
   else:
@@ -783,7 +824,7 @@ proc lRange*(r: Redis | AsyncRedis, key: string, start, stop: int): Future[Redis
   await r.sendCommand("LRANGE", key, @[$start, $stop])
   result = await r.readArray()
 
-proc lRem*(r: Redis | AsyncRedis, key: string, value: string, count: int = 0): Future[RedisInteger] {.multisync.} =
+proc lRem*(r: Redis | AsyncRedis, key: string, value: string, count = 0): Future[RedisInteger] {.multisync.} =
   ## Remove elements from a list. Returns the number of elements that have been
   ## removed.
   await r.sendCommand("LREM", key, @[$count, value])
@@ -809,7 +850,8 @@ proc rPopLPush*(r: Redis | AsyncRedis, source, destination: string): Future[Redi
   await r.sendCommand("RPOPLPUSH", source, @[destination])
   result = await r.readBulkString()
 
-proc rPush*(r: Redis | AsyncRedis, key, value: string, create: bool = true): Future[RedisInteger] {.multisync.} =
+proc rPush*(r: Redis | AsyncRedis, key, value: string,
+            create = true): Future[RedisInteger] {.multisync.} =
   ## Append a value to a list. Returns the length of the list after the push.
   ## The ``create`` param specifies whether a list should be created if it
   ## doesn't exist at ``key``. More specifically if ``create`` is true, `RPUSH`
@@ -821,7 +863,8 @@ proc rPush*(r: Redis | AsyncRedis, key, value: string, create: bool = true): Fut
 
   result = await r.readInteger()
 
-proc rLPush*(r: Redis | AsyncRedis, key: string, values: seq[string], create: bool = true): Future[RedisInteger] {.multisync.} =
+proc rPush*(r: Redis | AsyncRedis, key: string, values: seq[string],
+             create = true): Future[RedisInteger] {.multisync.} =
   ## Append a value to a list. Returns the length of the list after the push.
   ## The ``create`` param specifies whether a list should be created if it
   ## doesn't exist at ``key``. More specifically if ``create`` is true, `RPUSH`
@@ -833,6 +876,28 @@ proc rLPush*(r: Redis | AsyncRedis, key: string, values: seq[string], create: bo
 
   result = await r.readInteger()
 
+proc sort*(r: Redis | AsyncRedis, key: string, by="", offset = -1, count = -1,
+           desc=false, alpha=false, get: seq[string] = @[]): Future[RedisList] {.multisync.} =
+  var args: seq[string]
+  if by.len > 0:
+    args.add("BY")
+    args.add(by)
+  if offset > -1 and count > -1:
+    args.add("LIMIT")
+    args.add($offset)
+    args.add($count)
+  if get.len > 0:
+    for k in get:
+      args.add("GET")
+      args.add(k)
+  if desc:
+    args.add("DESC")
+  if alpha:
+    args.add("ALPHA")
+
+  await r.sendCommand("SORT", key, args)
+  result = await r.readArray()
+
 # Sets
 
 proc sadd*(r: Redis | AsyncRedis, key: string, member: string): Future[RedisInteger] {.multisync.} =
@@ -840,7 +905,7 @@ proc sadd*(r: Redis | AsyncRedis, key: string, member: string): Future[RedisInte
   await r.sendCommand("SADD", key, @[member])
   result = await r.readInteger()
 
-proc sladd*(r: Redis | AsyncRedis, key: string, members: seq[string]): Future[RedisInteger] {.multisync.} =
+proc sadd*(r: Redis | AsyncRedis, key: string, members: seq[string]): Future[RedisInteger] {.multisync.} =
   ## Add a member to a set
   await r.sendCommand("SADD", key, members)
   result = await r.readInteger()
@@ -872,10 +937,10 @@ proc sinterstore*(r: Redis | AsyncRedis, destination: string,
   await r.sendCommand("SINTERSTORE", destination, keys)
   result = await r.readInteger()
 
-proc sismember*(r: Redis | AsyncRedis, key: string, member: string): Future[RedisInteger] {.multisync.} =
+proc sismember*(r: Redis | AsyncRedis, key: string, member: string): Future[bool] {.multisync.} =
   ## Determine if a given value is a member of a set
   await r.sendCommand("SISMEMBER", key, @[member])
-  result = await r.readInteger()
+  result = (await r.readInteger()) == 1
 
 proc smembers*(r: Redis | AsyncRedis, key: string): Future[RedisList] {.multisync.} =
   ## Get all the members in a set
@@ -916,9 +981,19 @@ proc sunionstore*(r: Redis | AsyncRedis, destination: string,
 
 # Sorted sets
 
-proc zadd*(r: Redis | AsyncRedis, key: string, score: int, member: string): Future[RedisInteger] {.multisync.} =
+proc zadd*(r: Redis | AsyncRedis, key: string, score: float, member: string): Future[RedisInteger] {.multisync.} =
   ## Add a member to a sorted set, or update its score if it already exists
   await r.sendCommand("ZADD", key, @[$score, member])
+  result = await r.readInteger()
+
+proc zadd*(r: Redis | AsyncRedis, key: string,
+           members: seq[(string, float)]): Future[RedisInteger] {.multisync.} =
+  ## Add members to a sorted set, or update its score if it already exists
+  var values: seq[string]
+  for member, score in members.items:
+    values.add $score
+    values.add member
+  await r.sendCommand("ZADD", key, values)
   result = await r.readInteger()
 
 proc zcard*(r: Redis | AsyncRedis, key: string): Future[RedisInteger] {.multisync.} =
@@ -926,35 +1001,50 @@ proc zcard*(r: Redis | AsyncRedis, key: string): Future[RedisInteger] {.multisyn
   await r.sendCommand("ZCARD", key)
   result = await r.readInteger()
 
-proc zcount*(r: Redis | AsyncRedis, key: string, min: string, max: string): Future[RedisInteger] {.multisync.} =
+proc zcount*(r: Redis | AsyncRedis, key, min, max: string): Future[RedisInteger] {.multisync.} =
   ## Count the members in a sorted set with scores within the given values
   await r.sendCommand("ZCOUNT", key, @[min, max])
   result = await r.readInteger()
 
-proc zincrby*(r: Redis | AsyncRedis, key: string, increment: string,
+proc zincrby*(r: Redis | AsyncRedis, key: string, increment: float,
              member: string): Future[RedisString] {.multisync.}  =
   ## Increment the score of a member in a sorted set
-  await r.sendCommand("ZINCRBY", key, @[increment, member])
+  await r.sendCommand("ZINCRBY", key, @[$increment, member])
   result = await r.readBulkString()
 
-proc zinterstore*(r: Redis | AsyncRedis, destination: string, numkeys: string,
-                 keys: seq[string], weights: seq[string] = @[],
-                 aggregate: string = ""): Future[RedisInteger] {.multisync.} =
+proc zinterstore*(r: Redis | AsyncRedis, destination: string,
+                  keyWeights: seq[(string, float)],
+                  aggregate = ""): Future[RedisInteger] {.multisync.} =
   ## Intersect multiple sorted sets and store the resulting sorted set in
   ## a new key
-  var args: seq[string]
-  let argsLen = 2 + len(keys) + (if len(weights) > 0: len(weights) + 1 else: 0) + (if len(aggregate) > 0: 1 + len(aggregate) else: 0)
-  newSeq(args, argsLen)
+  var args = @[destination, $keyWeights.len]
+  var weights: seq[string]
 
-  args.add(destination)
-  args.add(numkeys)
+  for key, weight in keyWeights.items:
+    args.add(key)
+    weights.add($weight)
 
-  for i in items(keys):
-    args.add(i)
+  args.add("WEIGHTS")
+  args.add(weights)
+
+  if aggregate.len != 0:
+    args.add("AGGREGATE")
+    args.add(aggregate)
+
+  await r.sendCommand("ZINTERSTORE", args)
+  result = await r.readInteger()
+
+proc zinterstore*(r: Redis | AsyncRedis, destination: string,
+                 keys: seq[string], weights: seq[string] = @[],
+                 aggregate = ""): Future[RedisInteger] {.multisync.} =
+  ## Intersect multiple sorted sets and store the resulting sorted set in
+  ## a new key
+  var args = @[destination, $keys.len]
+  args.add(keys)
 
   if weights.len != 0:
     args.add("WEIGHTS")
-    for i in items(weights):
+    for i in weights:
       args.add(i)
 
   if aggregate.len != 0:
@@ -965,25 +1055,21 @@ proc zinterstore*(r: Redis | AsyncRedis, destination: string, numkeys: string,
 
   result = await r.readInteger()
 
-proc zrange*(r: Redis | AsyncRedis, key: string, start: string, stop: string,
-            withScores: bool = false): Future[RedisList] {.multisync.} =
+proc zrange*(r: Redis | AsyncRedis, key: string, start, stop: int,
+            withScores = false): Future[RedisList] {.multisync.} =
   ## Return a range of members in a sorted set, by index
   if not withScores:
-    await r.sendCommand("ZRANGE", key, @[start, stop])
+    await r.sendCommand("ZRANGE", key, @[$start, $stop])
   else:
-    await r.sendCommand("ZRANGE", key, @[start, stop, "WITHSCORES"])
+    await r.sendCommand("ZRANGE", key, @[$start, $stop, "WITHSCORES"])
 
   result = await r.readArray()
 
-proc zrangebyscore*(r: Redis | AsyncRedis, key: string, min: string, max: string,
-                   withScores: bool = false, limit: bool = false,
-                   limitOffset: int = 0, limitCount: int = 0): Future[RedisList] {.multisync.} =
+proc zrangebyscore*(r: Redis | AsyncRedis, key, min, max: string,
+                    withScores = false, limit = false, limitOffset = 0,
+                    limitCount = 0): Future[RedisList] {.multisync.} =
   ## Return a range of members in a sorted set, by score
-  var args: seq[string]
-  newSeq(args, 3 + (if withScores: 1 else: 0) + (if limit: 3 else: 0))
-  args.add(key)
-  args.add(min)
-  args.add(max)
+  var args = @[key, $min, $max]
 
   if withScores: args.add("WITHSCORES")
   if limit:
@@ -994,15 +1080,12 @@ proc zrangebyscore*(r: Redis | AsyncRedis, key: string, min: string, max: string
   await r.sendCommand("ZRANGEBYSCORE", args)
   result = await r.readArray()
 
-proc zrangebylex*(r: Redis | AsyncRedis, key: string, start: string, stop: string,
-                  limit: bool = false, limitOffset: int = 0,
-                  limitCount: int = 0): Future[RedisList] {.multisync.} =
+proc zrangebylex*(r: Redis | AsyncRedis, key, start, stop: string,
+                  limit = false, limitOffset = 0,
+                  limitCount = 0): Future[RedisList] {.multisync.} =
   ## Return a range of members in a sorted set, ordered lexicographically
-  var args: seq[string]
-  newSeq(args, 3 + (if limit: 3 else: 0))
-  args.add(key)
-  args.add(start)
-  args.add(stop)
+  var args = @[key, start, stop]
+
   if limit:
     args.add("LIMIT")
     args.add($limitOffset)
@@ -1011,33 +1094,36 @@ proc zrangebylex*(r: Redis | AsyncRedis, key: string, start: string, stop: strin
   await r.sendCommand("ZRANGEBYLEX", args)
   result = await r.readArray()
 
-proc zrank*(r: Redis | AsyncRedis, key: string, member: string): Future[RedisString] {.multisync.} =
+proc zrank*(r: Redis | AsyncRedis, key, member: string): Future[RedisInteger] {.multisync.} =
   ## Determine the index of a member in a sorted set
   await r.sendCommand("ZRANK", key, @[member])
   try:
-    result = $(await r.readInteger())
+    result = await r.readInteger()
   except ReplyError:
-    result = redisNil
+    result = -1
 
 proc zrem*(r: Redis | AsyncRedis, key: string, member: string): Future[RedisInteger] {.multisync.} =
   ## Remove a member from a sorted set
   await r.sendCommand("ZREM", key, @[member])
   result = await r.readInteger()
 
-proc zremrangebyrank*(r: Redis | AsyncRedis, key: string, start: string,
-                     stop: string): Future[RedisInteger] {.multisync.} =
+proc zrem*(r: Redis | AsyncRedis, key: string, members: seq[string]): Future[RedisInteger] {.multisync.} =
+  ## Remove members from a sorted set
+  await r.sendCommand("ZREM", key, members)
+  result = await r.readInteger()
+
+proc zremrangebyrank*(r: Redis | AsyncRedis, key, start, stop: string): Future[RedisInteger] {.multisync.} =
   ## Remove all members in a sorted set within the given indexes
   await r.sendCommand("ZREMRANGEBYRANK", key, @[start, stop])
   result = await r.readInteger()
 
-proc zremrangebyscore*(r: Redis | AsyncRedis, key: string, min: string,
-                      max: string): Future[RedisInteger] {.multisync.} =
+proc zremrangebyscore*(r: Redis | AsyncRedis, key, min, max: string): Future[RedisInteger] {.multisync.} =
   ## Remove all members in a sorted set within the given scores
   await r.sendCommand("ZREMRANGEBYSCORE", key, @[min, max])
   result = await r.readInteger()
 
 proc zrevrange*(r: Redis | AsyncRedis, key: string, start: string, stop: string,
-               withScores: bool = false): Future[RedisList] {.multisync.} =
+               withScores = false): Future[RedisList] {.multisync.} =
   ## Return a range of members in a sorted set, by index,
   ## with scores ordered from high to low
   if withScores:
@@ -1047,16 +1133,12 @@ proc zrevrange*(r: Redis | AsyncRedis, key: string, start: string, stop: string,
 
   result = await r.readArray()
 
-proc zrevrangebyscore*(r: Redis | AsyncRedis, key: string, min: string, max: string,
-                   withScores: bool = false, limit: bool = false,
-                   limitOffset: int = 0, limitCount: int = 0): Future[RedisList] {.multisync.} =
+proc zrevrangebyscore*(r: Redis | AsyncRedis, key, min, max: string,
+                       withScores = false, limit = false, limitOffset = 0,
+                       limitCount = 0): Future[RedisList] {.multisync.} =
   ## Return a range of members in a sorted set, by score, with
   ## scores ordered from high to low
-  var args: seq[string]
-  newSeq(args, 3 + (if withScores: 1 else: 0) + (if limit: 3 else: 0))
-  args.add(key)
-  args.add(min)
-  args.add(max)
+  var args = @[key, min, max]
 
   if withScores: args.add("WITHSCORES")
   if limit:
@@ -1067,7 +1149,7 @@ proc zrevrangebyscore*(r: Redis | AsyncRedis, key: string, min: string, max: str
   await r.sendCommand("ZREVRANGEBYSCORE", args)
   result = await r.readArray()
 
-proc zrevrank*(r: Redis | AsyncRedis, key: string, member: string): Future[RedisString] {.multisync.} =
+proc zrevrank*(r: Redis | AsyncRedis, key, member: string): Future[RedisString] {.multisync.} =
   ## Determine the index of a member in a sorted set, with
   ## scores ordered from high to low
   await r.sendCommand("ZREVRANK", key, @[member])
@@ -1076,33 +1158,51 @@ proc zrevrank*(r: Redis | AsyncRedis, key: string, member: string): Future[Redis
   except ReplyError:
     result = redisNil
 
-proc zscore*(r: Redis | AsyncRedis, key: string, member: string): Future[RedisString] {.multisync.} =
+proc zscore*(r: Redis | AsyncRedis, key, member: string): Future[float] {.multisync.} =
   ## Get the score associated with the given member in a sorted set
   await r.sendCommand("ZSCORE", key, @[member])
-  result = await r.readBulkString()
+  let score = await r.readBulkString()
+  if score.len > 0 and score != redisNil:
+    return parseFloat(score)
 
-proc zunionstore*(r: Redis | AsyncRedis, destination: string, numkeys: string,
-                 keys: seq[string], weights: seq[string] = @[],
-                 aggregate: string = ""): Future[RedisInteger] {.multisync.} =
+proc zunionstore*(r: Redis | AsyncRedis, destination: string,
+                  keyWeights: seq[(string, float)],
+                  aggregate = ""): Future[RedisInteger] {.multisync.} =
   ## Add multiple sorted sets and store the resulting sorted set in a new key
-  var args: seq[string]
-  newSeq(args, 2 + len(keys) + (if len(weights) > 0: 1 + len(weights) else: 0) + (if len(aggregate) > 0: 1 + len(aggregate) else: 0))
-  args.add(destination)
-  args.add(numkeys)
+  var args = @[destination, $keyWeights.len]
+  var weights: seq[string]
 
-  for i in items(keys):
-    args.add(i)
+  for key, weight in keyWeights.items:
+    args.add(key)
+    weights.add($weight)
 
-  if weights.len != 0:
-    args.add("WEIGHTS")
-    for i in items(weights): args.add(i)
+  args.add("WEIGHTS")
+  args.add(weights)
 
   if aggregate.len != 0:
     args.add("AGGREGATE")
     args.add(aggregate)
 
   await r.sendCommand("ZUNIONSTORE", args)
+  result = await r.readInteger()
 
+proc zunionstore*(r: Redis | AsyncRedis, destination: string,
+                 keys: seq[string], weights: seq[string] = @[],
+                 aggregate = ""): Future[RedisInteger] {.multisync.} =
+  ## Add multiple sorted sets and store the resulting sorted set in a new key
+  var args = @[destination, $keys.len]
+  args.add(keys)
+
+  if weights.len != 0:
+    args.add("WEIGHTS")
+    for i in weights:
+      args.add(i)
+
+  if aggregate.len != 0:
+    args.add("AGGREGATE")
+    args.add(aggregate)
+
+  await r.sendCommand("ZUNIONSTORE", args)
   result = await r.readInteger()
 
 # HyperLogLog
@@ -1131,7 +1231,7 @@ proc pfmerge*(r: Redis | AsyncRedis, destination: string, sources: seq[string]):
 
 # proc psubscribe*(r: Redis, pattern: openarray[string]): ???? =
 #   ## Listen for messages published to channels matching the given patterns
-#   r.socket.send("PSUBSCRIBE $#\c\L" % pattern)
+#   r.socket.send("PSUBSCRIBE $#\r\n" % pattern)
 #   return ???
 
 proc publish*(r: Redis | AsyncRedis, channel: string, message: string): Future[RedisInteger] {.multisync.} =
@@ -1141,7 +1241,7 @@ proc publish*(r: Redis | AsyncRedis, channel: string, message: string): Future[R
 
 # proc punsubscribe*(r: Redis, [pattern: openarray[string], : string): ???? =
 #   ## Stop listening for messages posted to channels matching the given patterns
-#   r.socket.send("PUNSUBSCRIBE $# $#\c\L" % [[pattern.join(), ])
+#   r.socket.send("PUNSUBSCRIBE $# $#\r\n" % [[pattern.join(), ])
 #   return ???
 
 proc subscribe*(r: AsyncRedis, channel: string) {.async.} =
@@ -1151,7 +1251,7 @@ proc subscribe*(r: AsyncRedis, channel: string) {.async.} =
 
 # proc unsubscribe*(r: Redis, [channel: openarray[string], : string): ???? =
 #   ## Stop listening for messages posted to the given channels
-#   r.socket.send("UNSUBSCRIBE $# $#\c\L" % [[channel.join(), ])
+#   r.socket.send("UNSUBSCRIBE $# $#\r\n" % [[channel.join(), ])
 #   return ???
 
 proc nextMessage*(r: AsyncRedis): Future[RedisMessage] {.async.} =
@@ -1187,10 +1287,34 @@ proc unwatch*(r: Redis | AsyncRedis): Future[void] {.multisync.} =
   await r.sendCommand("UNWATCH")
   raiseNoOK(r, await r.readStatus())
 
-proc watch*(r: Redis | AsyncRedis, key: seq[string]): Future[void] {.multisync.} =
+proc watch*(r: Redis | AsyncRedis, keys: seq[string]): Future[void] {.multisync.} =
   ## Watch the given keys to determine execution of the MULTI/EXEC block
-  await r.sendCommand("WATCH", key)
+  await r.sendCommand("WATCH", keys)
   raiseNoOK(r, await r.readStatus())
+
+template watchTimeout*(r: AsyncRedis; keys: seq[string]; timeout: float; body: untyped) =
+  let done = epochTime() + timeout
+  var first = true
+  while epochTime() < done or first :
+    first = false
+    try:
+      waitFor r.watch(keys)
+      body
+      break
+    except WatchError:
+      discard
+
+template watchTimeout*(r: Redis; keys: seq[string]; timeout: float; body: untyped) =
+  let done = epochTime() + timeout
+  var first = true
+  while epochTime() < done or first:
+    first = false
+    try:
+      r.watch(keys)
+      body
+      break
+    except WatchError:
+      discard
 
 # Connection
 
@@ -1276,17 +1400,18 @@ proc info*(r: Redis | AsyncRedis): Future[RedisString] {.multisync.} =
   await r.sendCommand("INFO")
   result = await r.readBulkString()
 
+proc infoTable*(r: Redis | AsyncRedis): Future[Table[string, string]] {.multisync.} =
+  ## Get information and statistics about the server as a table
+  var info = await r.info()
+  for line in info.split("\n"):
+    if line.len == 1 or line[0] == '#': continue
+    let keyval = line.split(":")
+    result[keyval[0]] = keyval[1].strip(chars={'\c'})
+
 proc lastsave*(r: Redis | AsyncRedis): Future[RedisInteger] {.multisync.} =
   ## Get the UNIX time stamp of the last successful save to disk
   await r.sendCommand("LASTSAVE")
   result = await r.readInteger()
-
-discard """
-proc monitor*(r: Redis) =
-  ## Listen for all requests received by the server in real time
-  r.socket.send("MONITOR\c\L")
-  raiseNoOK(r.readStatus(), r.pipeline.enabled)
-"""
 
 proc save*(r: Redis | AsyncRedis): Future[void] {.multisync.} =
   ## Synchronously save the dataset to disk
@@ -1313,31 +1438,6 @@ proc slaveof*(r: Redis | AsyncRedis, host: string, port: string): Future[void] {
   await r.sendCommand("SLAVEOF", host, @[port])
   raiseNoOK(r, await r.readStatus())
 
-iterator hPairs*(r: Redis, key: string): tuple[key, value: string] =
-  ## Iterator for keys and values in a hash.
-  var
-    contents = r.hGetAll(key)
-    k = ""
-  for i in items(contents):
-    if k == "":
-      k = i
-    else:
-      yield (k, i)
-      k = ""
-
-proc hPairs*(r: AsyncRedis, key: string): Future[seq[tuple[key, value: string]]] {.async.} =
-  var
-    contents = await r.hGetAll(key)
-    k = ""
-
-  result = @[]
-  for i in items(contents):
-    if k == "":
-      k = i
-    else:
-      result.add((k, i))
-      k = ""
-
 type
   SendMode = enum
     normal, pipelined, multiple
@@ -1360,15 +1460,16 @@ proc someTests(r: Redis | AsyncRedis, how: SendMode): Future[seq[string]] {.mult
   list.add(await r.get("nim:utf8"))
   list.add($(await r.hSet("test1", "name", "A Test")))
   var res = await r.hGetAll("test1")
-  for r in res:
-    list.add(r)
+  for k, v in res:
+    list.add(k)
+    list.add(v)
   list.add(await r.get("invalid_key"))
   list.add($(await r.lPush("mylist","itema")))
   list.add($(await r.lPush("mylist","itemb")))
   await r.lTrim("mylist",0,1)
   var p = await r.lRange("mylist", 0, -1)
 
-  for i in items(p):
+  for i in p:
     if i.len > 0:
       list.add(i)
 
@@ -1376,7 +1477,7 @@ proc someTests(r: Redis | AsyncRedis, how: SendMode): Future[seq[string]] {.mult
 
   await r.configSet("timeout", "299")
   var g = await r.configGet("timeout")
-  for i in items(g):
+  for i in g:
     list.add(i)
 
   list.add(await r.echoServ("BLAH"))
