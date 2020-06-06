@@ -43,8 +43,6 @@ const
   redisCl* = "\r\n"
   redisDol* = "$"
 
-var redisOut*: string
-
 type
   Pipeline = ref object
     enabled: bool
@@ -190,7 +188,6 @@ proc parseStatus(r: Redis | AsyncRedis, line = ""): RedisStatus =
   if line == "":
     raiseRedisError(r, "Server closed connection prematurely")
 
-  redisOut.add line & "\r\n"
 
   if line[0] == '-':
     raiseRedisError(r, strip(line))
@@ -217,8 +214,6 @@ proc parseInteger(r: Redis | AsyncRedis, line = ""): RedisInteger =
 
   if line == "":
     raiseRedisError(r, "Server closed connection prematurely")
-
-  redisOut.add line & "\r\n"
 
   if line[0] == '-':
     raiseRedisError(r, strip(line))
@@ -260,8 +255,8 @@ proc readSingleString(
     return
 
   var s = await r.managedRecv(numBytes + 2)
-  redisOut.add(line & s)
-  result = some(strip(s))
+  s.setLen max(0, s.len - 2)
+  result = some(s)
 
 proc readSingleString(r: Redis | AsyncRedis): Future[RedisString] {.multisync.} =
   # TODO: Rename these style of procedures to `processSingleString`?
@@ -276,7 +271,6 @@ proc readSingleString(r: Redis | AsyncRedis): Future[RedisString] {.multisync.} 
 proc readNext(r: Redis): RedisList
 proc readNext(r: AsyncRedis): Future[RedisList]
 proc readArrayLines(r: Redis | AsyncRedis, countLine: string): Future[RedisList] {.multisync.} =
-  redisOut.add countline & "\r\n"
   if countLine[0] != '*':
     raiseInvalidReply(r, '*', countLine[0])
 
@@ -337,10 +331,8 @@ proc readNext(r: Redis | AsyncRedis): Future[RedisList] {.multisync.} =
   var res: RedisList = @[]
   case typ[0]
   of '+':
-    redisOut.add(typ & line & "\r\n")
     res = @[line]
   of '-':
-    redisOut.add(typ & line & "\r\n")
     raiseRedisError(r, strip(line))
   of ':': res = @[$(r.parseInteger(typ & line))]
   of '$':
